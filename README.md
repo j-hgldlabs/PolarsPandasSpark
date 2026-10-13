@@ -51,7 +51,16 @@ Options:
 .venv/bin/python benchmark_1_ingest.py --repeats 3     # quicker check
 .venv/bin/python benchmark_1_ingest.py --warmup 0      # skip the warm-up run
 BENCH_REPEATS=5 bash run_all.sh                        # 5 repeats for all three
+.venv/bin/python benchmark_1_ingest.py --framework polars   # one framework only
 ```
+
+**One framework per process.** By default each script runs Polars, pandas and
+Spark one after another in the same Python process, so a framework can start
+with memory the previous one left behind. `--framework polars|pandas|spark`
+runs just that framework, so it has the process to itself. Its results are
+saved as `<benchmark>_<framework>_<timestamp>.json` (and `_runs.csv`). With a
+single framework there is nothing to rank it against, so the Speedup column
+shows "—"; `scale_sweep.py --isolate` combines the three and ranks them.
 
 To run all three benchmarks across multiple dataset sizes (the scale sweep):
 
@@ -59,6 +68,7 @@ To run all three benchmarks across multiple dataset sizes (the scale sweep):
 .venv/bin/python scale_sweep.py                    # 10M, 25M, 50M rows
 .venv/bin/python scale_sweep.py --sizes 10 25      # safer first test on 8 GB
 .venv/bin/python scale_sweep.py --repeats 3        # faster; 3 repeats per size
+.venv/bin/python scale_sweep.py --isolate          # each framework in its own process
 ```
 
 The sweep reuses `transactions.parquet` for 10 M rows and generates
@@ -374,8 +384,16 @@ framework do when it runs out of memory?
 ```bash
 .venv/bin/python scale_sweep.py                    # default: 10M, 25M, 50M rows
 .venv/bin/python scale_sweep.py --sizes 10 25      # two sizes only
-.venv/bin/python scale_sweep.py --repeats 3        # 3 timed runs instead of 10
+.venv/bin/python scale_sweep.py --repeats 3        # 3 timed runs (the default)
+.venv/bin/python scale_sweep.py --isolate          # each framework in its own process
 ```
+
+With `--isolate`, each benchmark is run three times per size, once per
+framework (`--framework polars`, then `pandas`, then `spark`), each in a fresh
+Python process. The three results are combined, ranked and printed in the same
+table. If one framework's process crashes (for example, macOS kills it for
+using too much memory), only that framework is marked `fail`; the other two
+still report.
 
 **How it works:**
 

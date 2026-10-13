@@ -7,6 +7,12 @@ Usage:
     .venv/bin/python scale_sweep.py                    # 10M, 25M, 50M rows
     .venv/bin/python scale_sweep.py --sizes 10 25      # custom sizes (millions)
     .venv/bin/python scale_sweep.py --repeats 3        # fewer repeats (faster)
+    .venv/bin/python scale_sweep.py --isolate          # each framework in its own process
+
+With --isolate, every benchmark runs once per framework (--framework polars,
+then pandas, then spark), each in a fresh Python process, so no framework
+starts with memory another one left behind. The three results are then
+combined and ranked as usual.
 
 Memory guide (estimated peak, Python process + Spark JVM combined):
     10M rows  ~3.7 GB   fits comfortably on 8 GB
@@ -37,6 +43,7 @@ BENCHMARKS = [
 
 FRAMEWORKS = ["Polars", "Pandas", "Spark (local[*])"]
 FW_SHORT   = {"Polars": "Polars", "Pandas": "Pandas", "Spark (local[*])": " Spark"}
+FW_KEY     = {"Polars": "polars", "Pandas": "pandas", "Spark (local[*])": "spark"}  # --framework values
 
 
 def _parquet_path(rows_m):
@@ -61,25 +68,37 @@ def _generate_if_needed(rows_m, parquet):
     return True
 
 
-def _run_benchmark(script, parquet, out_dir, repeats, warmup):
+def _run_benchmark(script, parquet, out_dir, repeats, warmup, framework=None):
     os.makedirs(out_dir, exist_ok=True)
-    r = subprocess.run(
-        [PYTHON, script,
-         "--parquet", parquet,
-         "--repeats", str(repeats),
-         "--warmup",  str(warmup),
-         "--results-dir", out_dir],
-        check=False,
-    )
+    cmd = [PYTHON, script,
+           "--parquet", parquet,
+           "--repeats", str(repeats),
+           "--warmup",  str(warmup),
+           "--results-dir", out_dir]
+    if framework:
+        cmd += ["--framework", framework]
+    r = subprocess.run(cmd, check=False)
     return r.returncode == 0
 
 
-def _load_summary(out_dir):
-    jsons = glob.glob(os.path.join(out_dir, "*.json"))
+def _load_summary(out_dir, framework=None):
+    # Isolated runs are saved as <benchmark>_<framework>_<timestamp>.json
+    pattern = f"*_{framework}_*.json" if framework else "*.json"
+    jsons = glob.glob(os.path.join(out_dir, pattern))
     if not jsons:
         return None
     with open(sorted(jsons)[-1]) as f:
         return json.load(f).get("summary")
+
+
+def _rank(entries):
+    """Recompute times_slower_than_fastest across separately run frameworks."""
+    ok = [e for e in entries if e.get("status") == "ok" and e.get("median_s") is not None]
+    if ok:
+        best = min(e["median_s"] for e in ok)
+        for e in ok:
+            e["times_slower_than_fastest"] = round(e["median_s"] / best, 2)
+    return entries
 
 
 def _cell(entry):
@@ -92,7 +111,7 @@ def _cell(entry):
     return f"{m:5.2f}s" if m is not None else "   OOM"
 
 
-def _print_table(sizes_m, results, repeats):
+def _print_table(sizes_m, results, repeats, isolate=False):
     col     = 7                        # chars per framework column
     block_w = len(FRAMEWORKS) * col    # chars for all three frameworks
     total_w = 14 + len(sizes_m) * (block_w + 2)
@@ -103,6 +122,8 @@ def _print_table(sizes_m, results, repeats):
     print("  SCALE SWEEP — MEDIAN ELAPSED TIME (seconds)")
     print(f"  {repeats} timed run(s) per framework  "
           f"|  OOM = out of memory  |  fail = subprocess error")
+    print("  " + ("each framework in its own process (--isolate)" if isolate
+                  else "all three frameworks share one process per benchmark"))
     print(bar)
 
     # Size labels centred over each framework block
@@ -172,13 +193,17 @@ def main():
                    help="timed runs per framework per benchmark (default: 3)")
     p.add_argument("--warmup", type=int, default=1,
                    help="warm-up runs per framework (default: 1)")
+    p.add_argument("--isolate", action="store_true",
+                   help="run each framework in its own process (--framework); "
+                        "default: all three share one process per benchmark")
     args = p.parse_args()
 
     stamp     = datetime.now().strftime("%Y%m%d-%H%M%S")
     sweep_dir = os.path.join("results", f"sweep_{stamp}")
     os.makedirs(sweep_dir, exist_ok=True)
 
-    print(f"\nScale sweep: sizes={args.sizes}M  repeats={args.repeats}  warmup={args.warmup}")
+    print(f"\nScale sweep: sizes={args.sizes}M  repeats={args.repeats}  "
+          f"warmup={args.warmup}  isolate={args.isolate}")
     print(f"Results: {sweep_dir}\n")
 
     results = {}
@@ -196,13 +221,27 @@ def main():
 
         for script, label in BENCHMARKS:
             bench_dir = os.path.join(sweep_dir, f"{size_m}M_{label.lower()}")
-            print(f"\n==> {label} …")
-            ok = _run_benchmark(script, parquet, bench_dir, args.repeats, args.warmup)
-            results[(size_m, label)] = _load_summary(bench_dir) if ok else None
-            if not ok:
-                print(f"  WARNING: {script} exited non-zero — recorded as fail")
+            if args.isolate:
+                entries = []
+                for fw in FRAMEWORKS:
+                    print(f"\n==> {label} — {fw} (own process) …")
+                    ok = _run_benchmark(script, parquet, bench_dir, args.repeats,
+                                        args.warmup, FW_KEY[fw])
+                    part = _load_summary(bench_dir, FW_KEY[fw]) if ok else None
+                    if part:
+                        entries.extend(part)
+                    else:
+                        print(f"  WARNING: {script} --framework {FW_KEY[fw]} "
+                              f"exited non-zero — recorded as fail")
+                results[(size_m, label)] = _rank(entries)
+            else:
+                print(f"\n==> {label} …")
+                ok = _run_benchmark(script, parquet, bench_dir, args.repeats, args.warmup)
+                results[(size_m, label)] = _load_summary(bench_dir) if ok else None
+                if not ok:
+                    print(f"  WARNING: {script} exited non-zero — recorded as fail")
 
-    _print_table(args.sizes, results, args.repeats)
+    _print_table(args.sizes, results, args.repeats, args.isolate)
 
     csv_path = os.path.join(sweep_dir, "sweep_summary.csv")
     _save_csv(args.sizes, results, csv_path)

@@ -69,6 +69,16 @@ ENV_VARS_TO_REPORT = [
 
 LIBRARIES = ["polars", "pandas", "pyarrow", "numpy", "pyspark", "py4j", "psutil"]
 
+# Values accepted by --framework. Each benchmark's framework names map onto
+# these by their first word: "Polars" -> polars, "Spark (local[*])" -> spark.
+FRAMEWORK_CHOICES = ["polars", "pandas", "spark"]
+
+
+def framework_key(name):
+    """Short key for a framework's display name, as used by --framework."""
+    return name.split()[0].lower()
+
+
 _spark = None
 _spark_info = None
 
@@ -255,6 +265,9 @@ def _parse_args(description):
                    help="input file (default transactions.parquet)")
     p.add_argument("--results-dir", default=RESULTS_DIR,
                    help="where to save results (default results/)")
+    p.add_argument("--framework", choices=FRAMEWORK_CHOICES, default=None,
+                   help="run only this framework, so it has the Python process to "
+                        "itself (default: all three, one after another, in one process)")
     args = p.parse_args()
     if args.repeats < 1:
         p.error("--repeats must be at least 1")
@@ -274,6 +287,10 @@ def run_benchmark(script_file, title, frameworks):
         print(f"ERROR: {args.parquet} not found — run generate_data.py first.")
         raise SystemExit(1)
 
+    if args.framework:
+        frameworks = [(n, f) for n, f in frameworks
+                      if framework_key(n) == args.framework]
+
     env = capture_environment(args.parquet)
     input_rows = env["dataset"]["rows"]
     names = [name for name, _ in frameworks]
@@ -292,8 +309,12 @@ def run_benchmark(script_file, title, frameworks):
         })
 
     print(f"\n  {title}")
-    print(f"  {args.warmup} warm-up + {args.repeats} timed run(s) per framework, "
-          f"order rotated each repeat\n")
+    if args.framework:
+        print(f"  {names[0]} only (--framework {args.framework}): "
+              f"{args.warmup} warm-up + {args.repeats} timed run(s)\n")
+    else:
+        print(f"  {args.warmup} warm-up + {args.repeats} timed run(s) per framework, "
+              f"order rotated each repeat\n")
     failed = set()
     try:
         for w in range(1, args.warmup + 1):
@@ -370,7 +391,12 @@ def _summarize(runs, names, input_rows):
             "first_run_mem_delta_mb": first["mem_delta_mb"],
         })
     ok = [s for s in summary if s["status"] == "ok"]
-    if ok:
+    if len(names) == 1:
+        # Nothing to compare against in this process; scale_sweep.py --isolate
+        # fills this in after combining the separate framework runs.
+        for s in ok:
+            s["times_slower_than_fastest"] = None
+    elif ok:
         best = min(s["median_s"] for s in ok)
         for s in ok:
             s["times_slower_than_fastest"] = round(s["median_s"] / best, 2)
@@ -394,8 +420,12 @@ def _print_summary(title, summary, input_rows, args, samples):
         if s.get("status") == "oom":
             print(f"  {s['framework']:<20} {'OOM':>8}  {'—':>15}  {'—':>13}  {'—':>9}  —")
             continue
-        label = ("◀ fastest" if s["median_s"] == best
-                 else f"{s['times_slower_than_fastest']:.1f}x slower")
+        if s["times_slower_than_fastest"] is None:
+            label = "—"
+        elif s["median_s"] == best:
+            label = "◀ fastest"
+        else:
+            label = f"{s['times_slower_than_fastest']:.1f}x slower"
         span = f"{s['min_s']:.2f}–{s['max_s']:.2f}s"
         print(f"  {s['framework']:<20} {s['median_s']:>7.2f}s  {span:>15}"
               f"  {s['input_rows_per_sec_median']:>11,}/s  {s['first_run_mem_delta_mb']:>9.0f}"
@@ -421,6 +451,8 @@ def _print_summary(title, summary, input_rows, args, samples):
 def _write_results(script_file, title, args, env, summary, runs):
     os.makedirs(args.results_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(script_file))[0]
+    if args.framework:
+        stem += f"_{args.framework}"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     json_path = os.path.join(args.results_dir, f"{stem}_{stamp}.json")
     csv_path = os.path.join(args.results_dir, f"{stem}_{stamp}_runs.csv")
@@ -431,7 +463,13 @@ def _write_results(script_file, title, args, env, summary, runs):
         "method": {
             "warmup_runs_per_framework": args.warmup,
             "timed_runs_per_framework": args.repeats,
-            "order": "rotated each repeat (repeat 1: as listed; repeat 2: shifted by one; ...)",
+            "frameworks_run": [s["framework"] for s in summary],
+            "framework_filter": args.framework,
+            "process": ("this framework only, in its own Python process"
+                        if args.framework else
+                        "all frameworks in one Python process"),
+            "order": ("not applicable (one framework)" if args.framework else
+                      "rotated each repeat (repeat 1: as listed; repeat 2: shifted by one; ...)"),
             "timing": "time.perf_counter() around the whole operation, including the "
                       "Parquet read; Spark startup excluded (Spark starts once per script)",
             "spark_action": "df.write.format('noop').mode('overwrite').save() — computes "
